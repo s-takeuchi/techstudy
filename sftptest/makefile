@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic
+CFLAGS ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic -DWITH_SERVER
 LDLIBS ?= -lssh
 
 all: sftp_server sftptest1 sftptest2 sftptest3

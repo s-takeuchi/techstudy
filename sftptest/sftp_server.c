@@ -21,11 +21,15 @@
 #define DEFAULT_HOST_KEY "/home/takeuchi/.ssh/ssh_host_rsa_key"
 #define DEFAULT_UPLOAD_DIR "./uploads"
 #define MAX_LOCAL_PATH 4096
+#define MAX_READ_REPLY (1024U * 1024U)
 
 typedef struct upload_handle {
     int fd;
     char *remote_path;
     char *local_path;
+    int readable;
+    int writable;
+    uint64_t bytes_read;
     uint64_t bytes_written;
 } upload_handle;
 
@@ -36,11 +40,14 @@ typedef struct config {
     unsigned int delay_init;
     unsigned int delay_open;
     unsigned int delay_write;
+    unsigned int delay_read;
     unsigned int delay_close;
     int fail_open;
     int fail_write;
+    int fail_read;
     int fail_close;
     unsigned long disconnect_after_write;
+    unsigned long disconnect_after_read;
     int accept_forever;
 } config;
 
@@ -108,11 +115,14 @@ static void load_config(config *cfg)
     cfg->delay_init = (unsigned int)env_ulong("SFTP_DELAY_INIT", 0);
     cfg->delay_open = (unsigned int)env_ulong("SFTP_DELAY_OPEN", 0);
     cfg->delay_write = (unsigned int)env_ulong("SFTP_DELAY_WRITE", 0);
+    cfg->delay_read = (unsigned int)env_ulong("SFTP_DELAY_READ", 0);
     cfg->delay_close = (unsigned int)env_ulong("SFTP_DELAY_CLOSE", 0);
     cfg->fail_open = env_bool("SFTP_FAIL_OPEN", 0);
     cfg->fail_write = env_bool("SFTP_FAIL_WRITE", 0);
+    cfg->fail_read = env_bool("SFTP_FAIL_READ", 0);
     cfg->fail_close = env_bool("SFTP_FAIL_CLOSE", 0);
     cfg->disconnect_after_write = env_ulong("SFTP_DISCONNECT_AFTER_WRITE", 0);
+    cfg->disconnect_after_read = env_ulong("SFTP_DISCONNECT_AFTER_READ", 0);
     cfg->accept_forever = env_bool("SFTP_ACCEPT_FOREVER", 1);
 }
 
@@ -128,6 +138,10 @@ static void print_config(const config *cfg)
            cfg->fail_open, cfg->fail_write, cfg->fail_close);
     printf("[CONFIG] disconnect_after_write=%lu\n",
            cfg->disconnect_after_write);
+    printf("[CONFIG] delay_read=%u sec\n", cfg->delay_read);
+    printf("[CONFIG] fail_read=%d\n", cfg->fail_read);
+    printf("[CONFIG] disconnect_after_read=%lu\n",
+           cfg->disconnect_after_read);
     printf("[CONFIG] accept_forever=%d\n", cfg->accept_forever);
 }
 
@@ -285,9 +299,11 @@ static int handle_open(sftp_session sftp,
                        const config *cfg)
 {
     const char *remote = sftp_client_message_get_filename(msg);
+    uint32_t flags = sftp_client_message_get_flags(msg);
     char local[MAX_LOCAL_PATH];
     upload_handle *h;
     ssh_string token;
+    int open_flags;
 
     delay_stage("OPEN", cfg->delay_open);
     if (cfg->fail_open) {
@@ -311,12 +327,30 @@ static int handle_open(sftp_session sftp,
         return sftp_reply_status(msg, SSH_FX_FAILURE, "Out of memory");
     }
 
-    h->fd = open(local, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    h->readable = (flags & SSH_FXF_READ) != 0;
+    h->writable = (flags & SSH_FXF_WRITE) != 0;
+
+    if (h->writable) {
+        /* Preserve the existing PUT behavior: create and truncate on OPEN. */
+        open_flags = O_WRONLY | O_CREAT | O_TRUNC;
+    } else if (h->readable) {
+        open_flags = O_RDONLY;
+    } else {
+        free_upload(h);
+        return sftp_reply_status(msg, SSH_FX_PERMISSION_DENIED,
+                                 "OPEN requires READ or WRITE access");
+    }
+
+    h->fd = open(local, open_flags, 0644);
     if (h->fd < 0) {
+        uint32_t status = (errno == ENOENT) ? SSH_FX_NO_SUCH_FILE
+                                            : SSH_FX_FAILURE;
+        const char *error_message = h->readable
+                                  ? "Cannot open source file"
+                                  : "Cannot create destination file";
         fprintf(stderr, "[FILE] open('%s'): %s\n", local, strerror(errno));
         free_upload(h);
-        return sftp_reply_status(msg, SSH_FX_FAILURE,
-                                 "Cannot create destination file");
+        return sftp_reply_status(msg, status, error_message);
     }
 
     token = sftp_handle_alloc(sftp, h);
@@ -326,7 +360,8 @@ static int handle_open(sftp_session sftp,
                                  "No SFTP handle available");
     }
 
-    printf("[SFTP] OPEN remote='%s' local='%s'\n", remote, local);
+    printf("[SFTP] OPEN mode=%s remote='%s' local='%s'\n",
+           h->writable ? "WRITE" : "READ", remote, local);
     if (sftp_reply_handle(msg, token) != SSH_OK) {
         sftp_handle_remove(sftp, h);
         ssh_string_free(token);
@@ -369,9 +404,15 @@ static int handle_write(sftp_session sftp,
                                  "Invalid file handle");
     }
 
+    if (msg->data == NULL) {
+        return sftp_reply_status(msg, SSH_FX_BAD_MESSAGE,
+                                 "Missing WRITE data");
+    }
+
     data = ssh_string_data(msg->data);
     len = ssh_string_len(msg->data);
     offset = msg->offset;
+
     if (len > 0 && data == NULL) {
         return sftp_reply_status(msg, SSH_FX_BAD_MESSAGE,
                                  "Missing WRITE data");
@@ -392,6 +433,118 @@ static int handle_write(sftp_session sftp,
     return sftp_reply_status(msg, SSH_FX_OK, "WRITE completed");
 }
 
+static int handle_read(sftp_session sftp,
+                       sftp_client_message msg,
+                       const config *cfg,
+                       unsigned long *read_count)
+{
+    upload_handle *h;
+    unsigned char *buffer;
+    size_t requested;
+    uint64_t offset;
+    ssize_t n;
+    int rc;
+
+    delay_stage("READ", cfg->delay_read);
+    ++(*read_count);
+
+    if (cfg->disconnect_after_read > 0 &&
+        *read_count >= cfg->disconnect_after_read) {
+        printf("[FAULT] READ #%lu: disconnect without DATA/STATUS reply\n",
+               *read_count);
+        ssh_disconnect(sftp->session);
+        return SSH_ERROR;
+    }
+    if (cfg->fail_read) {
+        return sftp_reply_status(msg, SSH_FX_FAILURE,
+                                 "Injected READ failure");
+    }
+
+    h = (upload_handle *)sftp_handle(sftp, msg->handle);
+    if (h == NULL || h->fd < 0) {
+        return sftp_reply_status(msg, SSH_FX_INVALID_HANDLE,
+                                 "Invalid file handle");
+    }
+    if (!h->readable) {
+        return sftp_reply_status(msg, SSH_FX_PERMISSION_DENIED,
+                                 "Handle is not open for reading");
+    }
+
+    requested = msg->len;
+    if (requested > MAX_READ_REPLY) {
+        requested = MAX_READ_REPLY;
+    }
+    offset = msg->offset;
+
+    if (requested == 0) {
+        return sftp_reply_data(msg, "", 0);
+    }
+
+    buffer = malloc(requested);
+    if (buffer == NULL) {
+        return sftp_reply_status(msg, SSH_FX_FAILURE, "Out of memory");
+    }
+
+    n = pread(h->fd, buffer, requested, (off_t)offset);
+    if (n < 0) {
+        fprintf(stderr,
+                "[FILE] pread('%s', offset=%" PRIu64 ", len=%zu): %s\n",
+                h->local_path, offset, requested, strerror(errno));
+        free(buffer);
+        return sftp_reply_status(msg, SSH_FX_FAILURE, "Local read failed");
+    }
+
+    if (n == 0) {
+        free(buffer);
+        printf("[SFTP] READ file='%s' offset=%" PRIu64
+               " requested=%zu EOF request=%lu\n",
+               h->local_path, offset, requested, *read_count);
+        return sftp_reply_status(msg, SSH_FX_EOF, "End of file");
+    }
+
+    h->bytes_read += (uint64_t)n;
+    printf("[SFTP] READ file='%s' offset=%" PRIu64
+           " requested=%zu returned=%zd request=%lu\n",
+           h->local_path, offset, requested, n, *read_count);
+    rc = sftp_reply_data(msg, buffer, (int)n);
+    free(buffer);
+    return rc;
+}
+
+static int handle_stat(sftp_client_message msg, const config *cfg)
+{
+    const char *remote = sftp_client_message_get_filename(msg);
+    char local[MAX_LOCAL_PATH];
+    struct stat st;
+    struct sftp_attributes_struct attr;
+
+    if (build_local_path(cfg->upload_dir, remote, local, sizeof(local)) != 0) {
+        return sftp_reply_status(msg, SSH_FX_PERMISSION_DENIED,
+                                 "Invalid path");
+    }
+    if (stat(local, &st) != 0) {
+        uint32_t status = (errno == ENOENT) ? SSH_FX_NO_SUCH_FILE
+                                            : SSH_FX_FAILURE;
+        return sftp_reply_status(msg, status, "File does not exist");
+    }
+
+    memset(&attr, 0, sizeof(attr));
+    attr.flags = SSH_FILEXFER_ATTR_SIZE |
+                 SSH_FILEXFER_ATTR_UIDGID |
+                 SSH_FILEXFER_ATTR_PERMISSIONS |
+                 SSH_FILEXFER_ATTR_ACMODTIME;
+    attr.size = (uint64_t)st.st_size;
+    attr.uid = (uint32_t)st.st_uid;
+    attr.gid = (uint32_t)st.st_gid;
+    attr.permissions = (uint32_t)st.st_mode;
+    attr.atime = (uint32_t)st.st_atime;
+    attr.mtime = (uint32_t)st.st_mtime;
+
+    printf("[SFTP] STAT remote='%s' local='%s' size=%" PRIu64 "\n",
+           remote, local, attr.size);
+    return sftp_reply_attr(msg, &attr);
+}
+
 static int handle_close(sftp_session sftp,
                         sftp_client_message msg,
                         const config *cfg)
@@ -405,11 +558,14 @@ static int handle_close(sftp_session sftp,
                                  "Invalid file handle");
     }
 
-    printf("[SFTP] CLOSE file='%s' bytes=%" PRIu64 "\n",
-           h->local_path, h->bytes_written);
+    printf("[SFTP] CLOSE file='%s' read=%" PRIu64
+           " written=%" PRIu64 "\n",
+           h->local_path, h->bytes_read, h->bytes_written);
     sftp_handle_remove(sftp, h);
     if (h->fd >= 0) {
-        (void)fsync(h->fd);
+        if (h->writable) {
+            (void)fsync(h->fd);
+        }
         close(h->fd);
         h->fd = -1;
     }
@@ -429,6 +585,7 @@ static int handle_sftp_session(ssh_session session,
     sftp_session sftp;
     sftp_client_message msg = NULL;
     unsigned long write_count = 0;
+    unsigned long read_count = 0;
 
     sftp = sftp_server_new(session, channel);
     if (sftp == NULL) {
@@ -441,11 +598,11 @@ static int handle_sftp_session(ssh_session session,
     if (sftp_server_init(sftp) != SSH_OK) {
         fprintf(stderr, "[SFTP] sftp_server_init: %s\n",
                 ssh_get_error(session));
-        sftp_free(sftp);
+        sftp_server_free(sftp);
         return -1;
     }
 
-    printf("[SFTP] initialized; multiple PUT requests are accepted\n");
+    printf("[SFTP] initialized; multiple PUT/GET requests are accepted\n");
     while (!g_stop && ssh_is_connected(session)) {
         uint8_t type;
         int rc;
@@ -468,13 +625,15 @@ static int handle_sftp_session(ssh_session session,
         case SSH_FXP_WRITE:
             rc = handle_write(sftp, msg, cfg, &write_count);
             break;
+        case SSH_FXP_READ:
+            rc = handle_read(sftp, msg, cfg, &read_count);
+            break;
         case SSH_FXP_CLOSE:
             rc = handle_close(sftp, msg, cfg);
             break;
         case SSH_FXP_LSTAT:
         case SSH_FXP_STAT:
-            rc = sftp_reply_status(msg, SSH_FX_NO_SUCH_FILE,
-                                   "File does not exist");
+            rc = handle_stat(msg, cfg);
             break;
         default:
             printf("[SFTP] unsupported request type=%u\n", type);
