@@ -1,5 +1,8 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
 #include <curl/curl.h>
 
 typedef struct {
@@ -41,7 +44,7 @@ int exec_curl()
 		curl_easy_setopt(curl, CURLOPT_READDATA, &upload_data);
 		curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)upload_data.size_left);
 		curl_easy_setopt(curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PUBLICKEY);
-		curl_easy_setopt(curl, CURLOPT_SSH_PRIVATE_KEYFILE, "/home/takeuchi/.ssh/id_ed25519");
+		curl_easy_setopt(curl, CURLOPT_SSH_PRIVATE_KEYFILE, "/home/takeuchi/.ssh/id_rsa");
 		curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
 		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
 		CURLcode res = curl_easy_perform(curl);

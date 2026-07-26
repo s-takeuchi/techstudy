@@ -18,7 +18,7 @@
 #include <libssh/sftp.h>
 
 #define DEFAULT_PORT 11111
-#define DEFAULT_HOST_KEY "/home/takeuchi/.ssh/ssh_host_rsa_key"
+#define DEFAULT_HOST_KEY "/home/takeuchi/.ssh/id_rsa"
 #define DEFAULT_UPLOAD_DIR "./uploads"
 #define MAX_LOCAL_PATH 4096
 #define MAX_READ_REPLY (1024U * 1024U)
