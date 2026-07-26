@@ -131,11 +131,11 @@ static void print_config(const config *cfg)
     printf("[CONFIG] port=%d\n", cfg->port);
     printf("[CONFIG] host_key=%s\n", cfg->host_key);
     printf("[CONFIG] upload_dir=%s\n", cfg->upload_dir);
-    printf("[CONFIG] delays init/open/write/close=%u/%u/%u/%u sec\n",
+    printf("[CONFIG] delays init/open/write/read/close=%u/%u/%u/%u/%u sec\n",
            cfg->delay_init, cfg->delay_open,
-           cfg->delay_write, cfg->delay_close);
-    printf("[CONFIG] failures open/write/close=%d/%d/%d\n",
-           cfg->fail_open, cfg->fail_write, cfg->fail_close);
+           cfg->delay_write, cfg->delay_read, cfg->delay_close);
+    printf("[CONFIG] failures open/write/read/close=%d/%d/%d/%d\n",
+           cfg->fail_open, cfg->fail_write, cfg->fail_read, cfg->fail_close);
     printf("[CONFIG] disconnect_after_write=%lu\n",
            cfg->disconnect_after_write);
     printf("[CONFIG] delay_read=%u sec\n", cfg->delay_read);

@@ -1,69 +1,295 @@
-# sftp_server_test.c
+# sftp_server_test
 
-libcurl/libsshのPUT・タイムアウト試験用の最小SFTPサーバです。
+A minimal SFTP server implemented with **libssh** for testing SFTP client
+behavior, timeout handling, and fault injection.
 
-## 対応内容
+This server is intended for **testing only** and is **not** suitable for
+production use.
 
-- 同一SFTP接続内で複数回のPUTを処理
-- クライアント切断後も次の接続を受付
-- ファイルごとに実ハンドルを管理
-- WRITEのoffsetを使ってpwrite
-- リモートファイル名ごとにuploads配下へ保存
-- INIT/OPEN/WRITE/CLOSEの遅延注入
-- OPEN/WRITE/CLOSEの失敗注入
-- N回目のWRITEで応答せず切断
+## Features
 
-## ビルド
+- Supports SFTP **PUT (upload)**.
+- Supports SFTP **GET (download)**.
+- Supports multiple file transfers within a single SFTP session.
+- Accepts multiple client connections sequentially.
+- Configurable delay injection for protocol testing.
+- Configurable failure injection.
+- Configurable forced disconnects.
+- Stores uploaded files under a configurable directory.
+- Serves downloaded files from the same directory.
+
+---
+
+# Supported Operations
+
+| Operation | Supported |
+|-----------|-----------|
+| INIT | Yes |
+| REALPATH | Yes |
+| STAT | Yes |
+| LSTAT | Yes |
+| OPEN | Yes |
+| READ | Yes |
+| WRITE | Yes |
+| CLOSE | Yes |
+
+The following operations are intentionally **not implemented**.
+
+- REMOVE
+- RENAME
+- MKDIR
+- RMDIR
+- READDIR
+- SYMLINK
+- HARDLINK
+- SETSTAT
+- FSETSTAT
+
+---
+
+# Build
 
 ```bash
 gcc -Wall -Wextra -O2 \
-  sftp_server_test.c \
-  $(pkg-config --cflags --libs libssh) \
-  -o sftp_server_test
+    sftp_server_test.c \
+    $(pkg-config --cflags --libs libssh) \
+    -o sftp_server_test
 ```
 
-または:
+or
 
 ```bash
-gcc -Wall -Wextra -O2 sftp_server_test.c -lssh -o sftp_server_test
+gcc -Wall -Wextra -O2 \
+    sftp_server_test.c \
+    -lssh \
+    -o sftp_server_test
 ```
 
-## 通常起動
+---
+
+# Default Configuration
+
+| Item | Default |
+|------|---------|
+| Port | 11111 |
+| Upload/Download directory | ./uploads |
+| Host key | /home/takeuchi/.ssh/ssh_host_rsa_key |
+
+---
+
+# Upload (PUT)
+
+Example:
 
 ```bash
-mkdir -p uploads
-./sftp_server_test
+sftp> put local.txt remote.txt
 ```
 
-## 主な環境変数
+The uploaded file is stored as
 
-```text
-SFTP_BIND_PORT=11111
-SFTP_HOST_KEY=/home/takeuchi/.ssh/ssh_host_rsa_key
-SFTP_UPLOAD_DIR=./uploads
-SFTP_DELAY_INIT=0
-SFTP_DELAY_OPEN=0
-SFTP_DELAY_WRITE=0
-SFTP_DELAY_CLOSE=0
-SFTP_FAIL_OPEN=0
-SFTP_FAIL_WRITE=0
-SFTP_FAIL_CLOSE=0
-SFTP_DISCONNECT_AFTER_WRITE=0
-SFTP_ACCEPT_FOREVER=1
+```
+./uploads/remote.txt
 ```
 
-WRITE応答を20秒遅らせる例:
+The directory portion of the remote path is ignored.
+
+Example
+
+```
+put local.txt /tmp/remote.txt
+```
+
+is stored as
+
+```
+./uploads/remote.txt
+```
+
+---
+
+# Download (GET)
+
+Files are served from the upload directory.
+
+Suppose
+
+```
+./uploads/test.txt
+```
+
+exists on the server.
+
+Then
 
 ```bash
-SFTP_DELAY_WRITE=20 ./sftp_server_test
+sftp> get test.txt
 ```
 
-3回目のWRITEでSTATUS応答を返さず切断する例:
+or
+
+```bash
+sftp> get /home/user/test.txt
+```
+
+downloads
+
+```
+./uploads/test.txt
+```
+
+Again, only the basename of the requested path is used.
+
+---
+
+# Delay Injection
+
+The server can intentionally delay protocol responses.
+
+| Environment Variable | Description |
+|----------------------|-------------|
+| SFTP_DELAY_INIT | Delay INIT reply |
+| SFTP_DELAY_REALPATH | Delay REALPATH reply |
+| SFTP_DELAY_OPEN | Delay OPEN reply |
+| SFTP_DELAY_READ | Delay READ reply |
+| SFTP_DELAY_WRITE | Delay WRITE reply |
+| SFTP_DELAY_CLOSE | Delay CLOSE reply |
+
+Example
+
+```bash
+SFTP_DELAY_READ=20 ./sftp_server_test
+```
+
+delays every READ response by 20 seconds.
+
+---
+
+# Failure Injection
+
+| Environment Variable | Description |
+|----------------------|-------------|
+| SFTP_FAIL_OPEN | Fail OPEN |
+| SFTP_FAIL_READ | Fail READ |
+| SFTP_FAIL_WRITE | Fail WRITE |
+| SFTP_FAIL_CLOSE | Fail CLOSE |
+
+Example
+
+```bash
+SFTP_FAIL_READ=1 ./sftp_server_test
+```
+
+returns an error for every READ request.
+
+---
+
+# Disconnect Injection
+
+| Environment Variable | Description |
+|----------------------|-------------|
+| SFTP_DISCONNECT_AFTER_READ | Disconnect after N READ requests |
+| SFTP_DISCONNECT_AFTER_WRITE | Disconnect after N WRITE requests |
+
+Example
 
 ```bash
 SFTP_DISCONNECT_AFTER_WRITE=3 ./sftp_server_test
 ```
 
-## 注意
+disconnects immediately after receiving the third WRITE request.
 
-これは障害再現用です。任意の公開鍵を受理し、downloadやディレクトリ操作は実装していません。本番サーバとしては使用しないでください。
+---
+
+# Protocol Flow
+
+## PUT
+
+```
+OPEN
+ ↓
+WRITE
+ ↓
+WRITE
+ ↓
+...
+ ↓
+CLOSE
+```
+
+## GET
+
+```
+STAT
+ ↓
+OPEN
+ ↓
+READ
+ ↓
+READ
+ ↓
+...
+ ↓
+EOF
+ ↓
+CLOSE
+```
+
+---
+
+# File Mapping
+
+The server intentionally ignores directory names.
+
+Example
+
+```
+/home/user/a.txt
+/tmp/a.txt
+a.txt
+```
+
+all refer to
+
+```
+./uploads/a.txt
+```
+
+This simplifies testing and avoids exposing arbitrary filesystem paths.
+
+---
+
+# Intended Usage
+
+This server is useful for testing
+
+- libcurl
+- libssh
+- libssh2
+- OpenSSH sftp
+- WinSCP
+- FileZilla
+- Paramiko
+- JSch
+
+especially for
+
+- timeout testing
+- retry testing
+- disconnect handling
+- protocol debugging
+- fault injection
+
+---
+
+# Notes
+
+This is a lightweight test server.
+
+It intentionally
+
+- accepts any public key (test only)
+- handles one client at a time
+- ignores directory hierarchy
+- does not implement filesystem management commands
+
+Do **not** use this server in production.

@@ -21,5 +21,6 @@ clean:
 	rm -f sftptest1
 	rm -f sftptest2
 	rm -f sftptest3
+	rm -f test_download.txt
 	yes|rm -r uploads
 

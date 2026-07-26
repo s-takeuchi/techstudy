@@ -1,12 +1,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
 #include <curl/curl.h>
 
 typedef struct {
 	const char* readptr;
 	size_t size_left;
 } UploadObject;
+
+size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata)
+{
+	FILE* fp = (FILE*)userdata;
+	return fwrite(ptr, size, nmemb, fp);
+}
 
 size_t read_callback(char* dest, size_t size, size_t nmemb, void* userp)
 {
@@ -25,7 +33,56 @@ size_t read_callback(char* dest, size_t size, size_t nmemb, void* userp)
 	return copy_size;
 }
 
-int exec_curl()
+int exec_get()
+{
+	const char* local_file = "test_download.txt";
+	FILE* fp = NULL;
+	CURL* curl = NULL;
+	int result = 1;
+
+	curl_global_init(CURL_GLOBAL_ALL);
+
+	fp = fopen(local_file, "wb");
+	if (fp == NULL) {
+		perror("fopen");
+		curl_global_cleanup();
+		return 1;
+	}
+
+	curl = curl_easy_init();
+	if (curl) {
+		curl_easy_setopt(curl, CURLOPT_URL, "sftp://takeuchi@172.21.177.22:11111/home/takeuchi/test.txt");
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+		curl_easy_setopt(curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PUBLICKEY);
+		curl_easy_setopt(curl, CURLOPT_SSH_PRIVATE_KEYFILE, "/home/takeuchi/.ssh/id_rsa");
+		curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
+
+		CURLcode res = curl_easy_perform(curl);
+		if (res == CURLE_OK) {
+			printf("Download success: %s\n", local_file);
+			result = 0;
+		} else {
+			printf("Download failure %s\n", curl_easy_strerror(res));
+		}
+		curl_easy_cleanup(curl);
+	} else {
+		fprintf(stderr, "curl_easy_init failure\n");
+	}
+	fclose(fp);
+	/*
+	 * ダウンロードに失敗した場合は、不完全なローカルファイルを削除する。
+	 */
+	if (result != 0) {
+		remove(local_file);
+	}
+
+	curl_global_cleanup();
+	return result;
+}
+
+int exec_put()
 {
 	curl_global_init(CURL_GLOBAL_ALL);
 	CURL* curl = curl_easy_init();
@@ -35,7 +92,7 @@ int exec_curl()
 		upload_data.readptr = data_to_send;
 		upload_data.size_left = strlen(data_to_send);
 		
-		curl_easy_setopt(curl, CURLOPT_URL, "sftp://takeuchi@172.21.177.24:11111/home/takeuchi/test.txt");
+		curl_easy_setopt(curl, CURLOPT_URL, "sftp://takeuchi@172.21.177.22:11111/home/takeuchi/test.txt");
 		//curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 		curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
 		curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
@@ -44,7 +101,7 @@ int exec_curl()
 		curl_easy_setopt(curl, CURLOPT_SSH_AUTH_TYPES, CURLSSH_AUTH_PUBLICKEY);
 		curl_easy_setopt(curl, CURLOPT_SSH_PRIVATE_KEYFILE, "/home/takeuchi/.ssh/id_rsa");
 		curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
-		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
 		CURLcode res = curl_easy_perform(curl);
 		if (res == CURLE_OK) {
 			printf("Upload success\n");
@@ -58,9 +115,74 @@ int exec_curl()
 	return 0;
 }
 
-int main(int argc, char* argv[])
+
+int get_used_memory()
 {
-	exec_curl();
-	return 0;
+	FILE *fp;
+	char ProcInfo[64];
+	char Buffer[4096];
+	sprintf(ProcInfo, "/proc/%d/status", getpid());
+	if ((fp = fopen(ProcInfo, "r")) == NULL) {
+		return -1;
+	}
+	int ActualFileSize = fread(Buffer, sizeof(char), 4096, fp);
+	fclose(fp);
+	char* Ptr = strstr(Buffer, "VmRSS:");
+	if (Ptr == NULL) {
+		return -1;
+	}
+	char DummyStr[32] = "";
+	int VmSize = 0;
+	sscanf(Ptr, "%s %d", DummyStr, &VmSize);
+	return VmSize;
 }
 
+int get_used_vmsize()
+{
+	FILE *fp;
+	char ProcInfo[64];
+	char Buffer[4096];
+	sprintf(ProcInfo, "/proc/%d/status", getpid());
+	if ((fp = fopen(ProcInfo, "r")) == NULL) {
+		return -1;
+	}
+	int ActualFileSize = fread(Buffer, sizeof(char), 4096, fp);
+	fclose(fp);
+	char* Ptr = strstr(Buffer, "VmSize:");
+	if (Ptr == NULL) {
+		return -1;
+	}
+	char DummyStr[32] = "";
+	int VmSize = 0;
+	sscanf(Ptr, "%s %d", DummyStr, &VmSize);
+	return VmSize;
+}
+
+int main(int argc, char* argv[])
+{
+	if (argc != 3) {
+		printf("Usage: %s <METHOD> <REPEAT> \n", argv[0]);
+		printf("METHOD: get, put\n");
+		printf("REPEAT: number of times to repeat the operation\n");
+		return 1;
+	}
+	int repeat = atoi(argv[2]);
+	if (repeat <= 0) {
+		printf("Invalid repeat count: %s\n", argv[2]);
+		return 1;
+	}
+	for (int i = 0; i < repeat; i++) {
+		int rss = get_used_memory();
+		int vmsize = get_used_vmsize();
+		printf("Iteration %d/%d, RSS: %d KB, VMSIZE: %d KB\n", i + 1, repeat, rss, vmsize);
+		if (strcmp(argv[1], "put") == 0) {
+			exec_put();
+		} else if (strcmp(argv[1], "get") == 0) {
+			exec_get();
+		} else {
+			printf("Invalid method: %s\n", argv[1]);
+			return 1;
+		}
+	}
+	return 0;
+}
